@@ -29,6 +29,8 @@ import (
 	"github.com/elastic/beats/libbeat/publisher"
 	"github.com/mheese/journalbeat/config"
 	"github.com/mheese/journalbeat/journal"
+
+	_ "github.com/mheese/journalbeat/custom_processors/collate_events"
 )
 
 // Journalbeat is the main Journalbeat struct
