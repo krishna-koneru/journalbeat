@@ -42,7 +42,7 @@ func TestCollateEvents(t *testing.T) {
 	yml := []map[string]interface{}{
 		{
 			"collate_events": map[string]interface{}{
-				"collation_interval_sec": 30,
+				"collation_interval_sec": 5,
 				"rules": map[string]interface{}{
 					"rule0":map[string]interface{}{
 						"when": map[string]interface{}{
@@ -103,7 +103,7 @@ func TestCollateEvents(t *testing.T) {
 
 	tm := time.Now()
 	event := common.MapStr{
-		"@timestamp": tm.Format(time.RFC3339),
+		"@realtime_timestamp": tm.UnixNano(),
 		"beat": common.MapStr{
 			"hostname": "mar",
 			"name":     "my-shipper-1",
@@ -126,6 +126,7 @@ func TestCollateEvents(t *testing.T) {
 			},
 		},
 		"type": "process",
+		"message" : "not useful message",
 	}
 
 	processedEvent := processors.Run(event)
@@ -133,7 +134,7 @@ func TestCollateEvents(t *testing.T) {
 
 	// burst of matching events
 	for i := 0; i<10; i++ {
-		event["@timestamp"] = time.Now().Format(time.RFC3339)
+		event["@realtime_timestamp"] = time.Now().UnixNano()
 		processedEvent = processors.Run(event)
 		assert.Equal(t, (common.MapStr)(nil), processedEvent)
 	}
@@ -141,19 +142,18 @@ func TestCollateEvents(t *testing.T) {
 	// matching events at lower pace
 	for i := 0; i<100; i++ {
 		tm = tm.Add(time.Second * 2)
-		event["@timestamp"] = tm.Format(time.RFC3339)
+		event["@realtime_timestamp"] = tm.UnixNano()
 		processedEvent = processors.Run(event)
 		assert.Equal(t, event, processedEvent)
 	}
 
-	event["@timestamp"] = time.Now().Format(time.RFC3339)
+	event["@realtime_timestamp"] = time.Now().UnixNano()
 	processedEvent = processors.Run(event)
 
 	// another burst of matching events
-	for i := 0; i<100000; i++ {
-		event["@timestamp"] = time.Now().Format(time.RFC3339)
+	for i := 0; i<10000; i++ {
+		event["@realtime_timestamp"] = time.Now().UnixNano()
 		processedEvent = processors.Run(event)
 		assert.Equal(t, (common.MapStr)(nil), processedEvent)
 	}
-
 }

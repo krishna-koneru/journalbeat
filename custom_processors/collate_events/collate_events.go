@@ -1,23 +1,30 @@
 package collate_events
 
 import (
+	"fmt"
+	"time"
+	"strings"
 	"github.com/elastic/beats/libbeat/common"
 	p "github.com/elastic/beats/libbeat/processors"
 	"github.com/elastic/beats/libbeat/logp"
-	"fmt"
-	"time"
+	"github.com/elastic/beats/libbeat/publisher"
 )
 
 type eventCounter struct {
-	Count int
+	Count         int
+	ServiceNames  map[string]int // number of times a service matched the rule.
 	LastTimestamp time.Time
 }
 
 type collateEvents struct {
 	Interval int
-	Rules map[string]*p.Condition
-	Metrics map[string]*eventCounter
+	Rules    map[string]*p.Condition
+	Metrics  map[string]*eventCounter
+	Events   map[string]common.MapStr
 }
+
+// this is set by journalbeat
+var Pub publisher.Publisher
 
 func init() {
 	p.RegisterPlugin("collate_events",newCollateEvents)
@@ -37,6 +44,7 @@ func newCollateEvents(c common.Config) (p.Processor, error) {
 		Interval:cfg.Interval,
 		Rules:map[string]*p.Condition{},
 		Metrics:map[string]*eventCounter{},
+		Events:map[string]common.MapStr{},
 	}
 
 	// construct a map of rule_id -> conditions
@@ -55,33 +63,71 @@ func newCollateEvents(c common.Config) (p.Processor, error) {
 				return nil, err
 			}
 			cEvents.Rules[ruleId] = cond
-			cEvents.Metrics[ruleId] = &eventCounter{Count:0, LastTimestamp:time.Now()}
+			cEvents.Metrics[ruleId] = &eventCounter{Count:0, ServiceNames:map[string]int{}, LastTimestamp:time.Now()}
 		}
 	}
 	go cEvents.LogAndResetAllMetrics() // start thread that logs.
+	logp.Info("%s", cEvents.String())
 	return &cEvents,nil
 }
 
 
 func (f *collateEvents) LogAndResetAllMetrics () {
 
+
 	tickChannel := time.NewTicker(time.Second * time.Duration(f.Interval)).C
 	quit := make(chan struct{})
 
+	// Publisher is set up after processers are loaded.
+	// wait for publisher to be setup.
+	for i :=0 ; i < 10 ; i ++ {
+		if Pub != nil {
+			break
+		} else {
+			time.Sleep(time.Second)
+		}
+	}
+
+	var Client publisher.Client
+	if Pub != nil {
+		Client = Pub.Connect()
+	} else {
+		Client = nil
+	}
 	for {
 		select {
 		case <- tickChannel:
 			total := 0
-			logstr := ""
+			var events []common.MapStr
 			for id,m := range f.Metrics {
 				if m.Count > 1 {
-					logstr += fmt.Sprintf(" collate_events.%s=%d", id, m.Count)
+					if len(m.ServiceNames) > 1 {
+						str := ""
+						for n,c := range m.ServiceNames {
+							str += fmt.Sprintf("%s (%d times), ", n, c)
+						}
+						logp.Warn("collation rule %s matches messages from multiple systemd_units : %s", id, str)
+					} else {
+						event := f.Events[id]
+						event.Put("@collated_event", true)
+						event["@timestamp"] = time.Now()
+						event["@realtime_timestamp"] = time.Now().UnixNano()
+						event["message"] = fmt.Sprintf("Collated %d messages in the last %ds for rule: rule_id=%s msg='%s'.", m.Count, f.Interval, id, event["message"])
+						events = append(events, event)
+					}
+					f.Events[id] = common.MapStr{} // reset
 					total += m.Count
 				}
 				m.Count = 0
+				m.ServiceNames = map[string]int{}
 				m.LastTimestamp = time.Now()
 			}
-			logp.Info("%d events collated in last %d seconds.%s ", total, f.Interval, logstr)
+
+			if Client != nil {
+				Client.PublishEvents(events, publisher.Metadata(common.MapStr{}))
+			} else if len(events) > 0 {
+				logp.Err("could not publish %d collated events" , len(events))
+			}
 		case <- quit:
 			return
 		}
@@ -90,43 +136,46 @@ func (f *collateEvents) LogAndResetAllMetrics () {
 
 func (f *collateEvents) Run(event common.MapStr) (common.MapStr, error) {
 
+	if summary,_ := event.HasKey("@collated_event"); summary { return event,nil }
 	logp.LogInit(logp.LOG_INFO, "", false, true, []string{"collate_events"})
 	sendEvent := true
 	for id,r := range f.Rules {
 		if r.Check(event) {
 			// Event matches a rule. Check if an event already matched in collation interval
-			tsStr, err := event.GetValue("@timestamp"); if err != nil {
-				logp.Err("%s",err)
+			// Use @realtime_timestamp unitl journalbeat updates to libbeat 6.x
+			// events is a MapStr (in libbeat 5.x), time.Parse takes too much CPU for large number of events.
+			ts, err := event.GetValue("@realtime_timestamp"); if err != nil {
 				break
 			}
-			var ts time.Time
-			switch tsStr.(type) {
-			case common.Time:
-				ts, err = time.Parse(time.RFC3339, tsStr.(common.Time).String()) ; if err != nil { //probably the shittiest line of code to be ever written.
-				logp.Err("%s", err)
-				return event, nil
-			}
-			case time.Time:
-				ts = tsStr.(time.Time)
-			case string:
-				ts, err = time.Parse(time.RFC3339, tsStr.(string)) ; if err != nil {
-				logp.Err("%s", err)
-				return event, nil
-				}
-			default:
-				logp.Err("%s", err)
-				return event, nil
-			}
 
-			if diff := ts.Sub(f.Metrics[id].LastTimestamp); f.Metrics[id].Count < 1 || diff.Nanoseconds() > 1 * 1e9 {
-				f.Metrics[id].Count += 1;
-				f.Metrics[id].LastTimestamp = ts
+			tsTime := time.Unix(0,int64(ts.(int64)))
+			var serviceName string
+
+			if diff := tsTime.Sub(f.Metrics[id].LastTimestamp); f.Metrics[id].Count < 1 || diff.Nanoseconds() > 1 * 1e9 {
+				f.Metrics[id].Count = 1;
+				f.Metrics[id].LastTimestamp = tsTime
+				val, err := event.GetValue("journal.systemd_unit"); if err != nil {
+					serviceName = "-"
+				} else {
+					serviceName = val.(string)
+				}
+				f.Metrics[id].ServiceNames[serviceName] = 1
+				f.Events[id] = event
 			} else {
 				// Dont send the event. A matching event has been already sent in the past second.
 				f.Metrics[id].Count += 1;
-				f.Metrics[id].LastTimestamp = ts
+				f.Metrics[id].LastTimestamp = tsTime
+				val, err := event.GetValue("journal.systemd_unit"); if err != nil {
+					serviceName = "-"
+				} else {
+					serviceName = val.(string)
+				}
+				if _,found := f.Metrics[id].ServiceNames[serviceName] ; !found {
+					f.Metrics[id].ServiceNames[serviceName] = 0
+				}
+				f.Metrics[id].ServiceNames[serviceName] += 1
 				sendEvent = false
-				break; // event collated, skip checking other rules..
+				break // event collated, skip checking other rules..
 			}
 		}
 	}
@@ -140,5 +189,13 @@ func (f *collateEvents) Run(event common.MapStr) (common.MapStr, error) {
 }
 
 func (f *collateEvents) String() string {
-	return "collate_events= " + fmt.Sprintf("Rules: %+v",f.Rules)
+
+	ruleIds := make([]string, len(f.Rules))
+	i := 0
+	for k := range f.Rules {
+		ruleIds[i] = k
+		i++
+	}
+	return "collate_events:" + fmt.Sprintf("Active rules=[%s]",strings.Join(ruleIds, ","))
 }
+
