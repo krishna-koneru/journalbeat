@@ -29,6 +29,8 @@ import (
 	"github.com/elastic/beats/libbeat/publisher"
 	"github.com/mheese/journalbeat/config"
 	"github.com/mheese/journalbeat/journal"
+
+	"github.com/mheese/journalbeat/custom_processors/collate_events"
 )
 
 // Journalbeat is the main Journalbeat struct
@@ -174,7 +176,7 @@ func New(b *beat.Beat, cfg *common.Config) (beat.Beater, error) {
 		logp.Err("Failed to connect to the Systemd Journal: %v", err)
 		return nil, err
 	}
-
+	collate_events.Pub = b.Publisher
 	return jb, nil
 }
 
