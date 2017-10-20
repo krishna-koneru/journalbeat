@@ -178,6 +178,7 @@ func New(b *beat.Beat, cfg *common.Config) (beat.Beater, error) {
 	}
 
 	jb.client = b.Publisher.Connect()
+
 	collate_events.Pub = b.Publisher
 	return jb, nil
 }
